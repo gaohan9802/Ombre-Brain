@@ -136,7 +136,14 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、用户可能用不同措辞搜索的词
    两步合并为一个 tags 数组，总计 10~15 个
 5. suggested_name（建议桶名）：10字以内的简短标题
-6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+6. structure_type（结构类型）：判断这条记忆的意图类型
+   - "fact"：记录事实/事件（默认）
+   - "promise"：承诺、计划、打算做的事
+   - "desire"：渴望、想要、期待
+   - "fear"：害怕、担心、焦虑
+   - "tension"：情绪冲突、矛盾
+   - "decision"：做出决定、选择
+7. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -144,7 +151,8 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "valence": 0.7,
   "arousal": 0.4,
   "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
-  "suggested_name": "简短标题"
+  "suggested_name": "简短标题",
+  "structure_type": "fact"
 }"""
 
 
@@ -479,6 +487,7 @@ class Dehydrator:
             "arousal": arousal,
             "tags": result.get("tags", [])[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
+            "structure_type": str(result.get("structure_type", "fact"))[:20],
         }
 
     # ---------------------------------------------------------
@@ -496,6 +505,7 @@ class Dehydrator:
             "arousal": 0.3,
             "tags": [],
             "suggested_name": "",
+            "structure_type": "fact",
         }
 
     # ---------------------------------------------------------
@@ -597,3 +607,26 @@ class Dehydrator:
                 "importance": importance,
             })
         return validated
+
+    # ---------------------------------------------------------
+    # Generic LLM call (for family engine, fact extraction, etc.)
+    # 通用 LLM 调用（供家族引擎、事实抽取等使用）
+    # ---------------------------------------------------------
+    async def llm_call(self, prompt: str, max_tokens: int = 1024) -> str:
+        """
+        Generic LLM call that returns raw text response.
+        Used by family_engine for summary generation and fact extraction.
+        """
+        if not self.api_available:
+            raise RuntimeError("LLM API not available")
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        if not response.choices:
+            return ""
+        return response.choices[0].message.content or ""

@@ -42,6 +42,7 @@ import hmac
 import secrets
 import time
 import json as _json_lib
+from datetime import datetime
 import httpx
 
 
@@ -57,6 +58,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from family_engine import FamilyEngine
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -102,6 +104,7 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+family_engine = FamilyEngine(config, embedding_engine, dehydrator, bucket_mgr)  # Family engine / 家族聚合引擎
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -644,12 +647,21 @@ async def breath(
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
                 continue
 
-        if not pinned_results and not dynamic_results:
+        # --- Layer 2: Family summaries ---
+        family_results = []
+        try:
+            family_results = await family_engine.surface_families(max_results=3, max_tokens=2000)
+        except Exception as e:
+            logger.warning(f"Family surfacing failed: {e}")
+
+        if not pinned_results and not dynamic_results and not family_results:
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+        if family_results:
+            parts.append("=== 家族记忆 ===\n" + "\n---\n".join(family_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
         return "\n\n".join(parts)
@@ -763,11 +775,24 @@ async def breath(
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
-    if not results:
+    # --- Layer 2: Family search — prepend matching family summaries ---
+    family_search_results = []
+    try:
+        family_search_results = await family_engine.search_families(query, max_results=2)
+    except Exception as e:
+        logger.warning(f"Family search failed: {e}")
+
+    if not results and not family_search_results:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
         return "未找到相关记忆。"
 
-    final_text = "\n---\n".join(results)
+    all_parts = []
+    if family_search_results:
+        all_parts.append("=== 相关家族 ===\n" + "\n---\n".join(family_search_results))
+    if results:
+        all_parts.append("\n---\n".join(results))
+
+    final_text = "\n\n".join(all_parts)
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
     return final_text
 
@@ -883,6 +908,49 @@ async def hold(
     )
 
     action = "合并→" if is_merged else "新建→"
+
+    # --- Layer 2: Family clustering + fact extraction (fire-and-forget) ---
+    async def _family_post_process(bucket_id, text, meta_dict):
+        try:
+            # Structural type detection (prefer LLM analysis, fallback to keyword)
+            struct_type = analysis.get("structure_type", "") or family_engine.detect_structure_type(analysis, text)
+
+            # Add revisit schedule based on importance
+            revisit_schedule = family_engine.get_revisit_schedule(importance)
+            if revisit_schedule or struct_type != "fact":
+                update_kw = {}
+                if revisit_schedule:
+                    update_kw["revisit_schedule"] = revisit_schedule
+                if struct_type != "fact":
+                    update_kw["structure_type"] = struct_type
+                if update_kw:
+                    try:
+                        await bucket_mgr.update(bucket_id, **update_kw)
+                    except Exception:
+                        pass
+
+            # Assign to family
+            family_id = await family_engine.assign_bucket(bucket_id, text, meta_dict)
+
+            # Extract facts and store in family
+            if family_id:
+                facts = await family_engine.extract_facts(text)
+                if facts:
+                    await family_engine.store_facts_for_family(family_id, facts)
+        except Exception as e:
+            logger.warning(f"Family post-process failed for {bucket_id}: {e}")
+
+    # Build metadata dict for family engine
+    _meta_for_family = {
+        "valence": final_valence,
+        "arousal": final_arousal,
+        "importance": importance,
+        "domain": domain,
+        "tags": all_tags,
+        "created": datetime.now().isoformat(),
+    }
+    asyncio.create_task(_family_post_process(result_name, content, _meta_for_family))
+
     return f"{action}{result_name} {','.join(domain)}"
 
 
@@ -1000,6 +1068,7 @@ async def trace(
         success = await bucket_mgr.delete(bucket_id)
         if success:
             embedding_engine.delete_embedding(bucket_id)
+            family_engine.remove_bucket_from_families(bucket_id)
         return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
@@ -1254,7 +1323,35 @@ async def dream() -> str:
         except Exception as e:
             logger.warning(f"Dream crystallization hint failed: {e}")
 
-    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
+    # --- Layer 2: Spaced revisit — surface due revisit buckets ---
+    revisit_hint = ""
+    try:
+        due_revisits = await family_engine.get_due_revisits()
+        if due_revisits:
+            revisit_parts = []
+            for rv in due_revisits[:3]:
+                rb = rv["bucket"]
+                due_day = rv["due_day"]
+                days_since = rv["days_since_created"]
+                rmeta = rb["metadata"]
+                revisit_parts.append(
+                    f"[{rmeta.get('name', rb['id'])}] 第{due_day}天回访 (已过{days_since}天) "
+                    f"[bucket_id:{rb['id']}]\n{strip_wikilinks(rb['content'][:200])}"
+                )
+                # Mark this revisit day as done
+                try:
+                    revisited_days = list(rmeta.get("revisited_days", []))
+                    if due_day not in revisited_days:
+                        revisited_days.append(due_day)
+                    await bucket_mgr.update(rb["id"], revisited_days=revisited_days, last_revisit=datetime.now().isoformat())
+                except Exception:
+                    pass
+            if revisit_parts:
+                revisit_hint = "\n\n=== 间隔回访 ===\n" + "\n---\n".join(revisit_parts) + "\n"
+    except Exception as e:
+        logger.warning(f"Dream revisit check failed: {e}")
+
+    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + revisit_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
 
@@ -1263,7 +1360,7 @@ async def dream() -> str:
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
-@mcp.custom_route("/api/buckets", methods=["GET"])
+@mcp.custom_route("/api/buckets", methods=["GET", "POST"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
     from starlette.responses import JSONResponse
@@ -1318,13 +1415,21 @@ async def api_bucket_detail(request):
     })
 
 
-@mcp.custom_route("/api/search", methods=["GET"])
+@mcp.custom_route("/api/search", methods=["GET", "POST"])
 async def api_search(request):
-    """Search buckets by query."""
+    """Search buckets by query (GET: ?q=... or POST: {"q": "..."})."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
-    query = request.query_params.get("q", "")
+    query = ""
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            query = body.get("q", body.get("query", ""))
+        except Exception:
+            query = ""
+    if not query:
+        query = request.query_params.get("q", "")
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
@@ -1341,7 +1446,15 @@ async def api_search(request):
                 "arousal": meta.get("arousal", 0.3),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
-        return JSONResponse(result)
+        # Also include family results
+        family_results = []
+        try:
+            fam_matches = await family_engine.search_families(query, max_results=3)
+            for fm in fam_matches:
+                family_results.append(fm)
+        except Exception:
+            pass
+        return JSONResponse({"buckets": result, "families": family_results})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1390,6 +1503,90 @@ async def api_network(request):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
+
+# =============================================================
+# Family API endpoints (for frontend memory view)
+# 家族 API 端点（供前端记忆视图使用）
+# =============================================================
+
+@mcp.custom_route("/api/families", methods=["GET"])
+async def api_families(request):
+    """List all memory families."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        families = family_engine.get_all_families()
+        return JSONResponse({"families": families})
+    except Exception as e:
+        logger.error(f"api_families error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@mcp.custom_route("/api/family/{family_id}", methods=["GET"])
+async def api_family_detail(request):
+    """Get detailed family info including member contents."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    family_id = request.path_params["family_id"]
+    try:
+        fam = family_engine.get_family(family_id)
+        if not fam:
+            return JSONResponse({"error": "Family not found"}, status_code=404)
+        # Expand member details
+        member_details = []
+        for mid in fam.get("members", []):
+            bucket = await bucket_mgr.get(mid)
+            if bucket:
+                member_details.append({
+                    "id": mid,
+                    "name": bucket["metadata"].get("name", ""),
+                    "content": bucket["content"][:500],
+                    "valence": bucket["metadata"].get("valence", 0.5),
+                    "arousal": bucket["metadata"].get("arousal", 0.3),
+                    "created": bucket["metadata"].get("created", ""),
+                    "importance": bucket["metadata"].get("importance", 5),
+                })
+        fam["member_details"] = member_details
+        return JSONResponse(fam)
+    except Exception as e:
+        logger.error(f"api_family_detail error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@mcp.custom_route("/api/family/{family_id}/expand", methods=["GET"])
+async def api_family_expand(request):
+    """Expand family — return full text for breath/chat consumption."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    family_id = request.path_params["family_id"]
+    try:
+        text = await family_engine.expand_family(family_id)
+        return JSONResponse({"text": text})
+    except Exception as e:
+        logger.error(f"api_family_expand error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@mcp.custom_route("/api/lines", methods=["GET"])
+async def api_lines(request):
+    """Get cross-cutting lines (verb dimensions across families)."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        lines = await family_engine.get_lines()
+        # Format for frontend: {action: count, items: [...]}
+        formatted = {}
+        for action, items in lines.items():
+            formatted[action] = {
+                "count": len(items),
+                "items": items[:20],  # limit per action
+            }
+        return JSONResponse({"lines": formatted})
+    except Exception as e:
+        logger.error(f"api_lines error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
 async def api_breath_debug(request):
